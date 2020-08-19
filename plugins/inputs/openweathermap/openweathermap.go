@@ -55,7 +55,7 @@ var sampleConfig = `
   ## "se", "sk", "sl", "es", "tr", "ua", "vi", "zh_cn", "zh_tw"
   # lang = "en"
 
-  ## APIs to fetch; can contain "weather" or "forecast".
+  ## APIs to fetch; can contain "weather", "group" or "forecast".
   fetch = ["weather", "forecast"]
 
   ## OpenWeatherMap base URL
@@ -92,7 +92,7 @@ func (n *OpenWeatherMap) Gather(acc telegraf.Accumulator) error {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					status, err := n.gatherUrl(addr)
+					status, err := n.gatherUrlForecastOrGroup(addr)
 					if err != nil {
 						acc.AddError(err)
 						return
@@ -102,6 +102,21 @@ func (n *OpenWeatherMap) Gather(acc telegraf.Accumulator) error {
 				}()
 			}
 		} else if fetch == "weather" {
+			for _, city := range n.CityId {
+				addr := n.formatURL("/data/2.5/weather", city)
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					status, err := n.gatherUrlSingleCity(addr)
+					if err != nil {
+						acc.AddError(err)
+						return
+					}
+
+					gatherWeather(acc, status)
+				}()
+			}
+		} else if fetch == "group" {
 			j := 0
 			for j < len(n.CityId) {
 				strs = make([]string, 0)
@@ -115,13 +130,13 @@ func (n *OpenWeatherMap) Gather(acc telegraf.Accumulator) error {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					status, err := n.gatherUrl(addr)
+					status, err := n.gatherUrlForecastOrGroup(addr)
 					if err != nil {
 						acc.AddError(err)
 						return
 					}
 
-					gatherWeather(acc, status)
+					gatherGroup(acc, status)
 				}()
 			}
 
@@ -145,7 +160,7 @@ func (n *OpenWeatherMap) createHttpClient() (*http.Client, error) {
 	return client, nil
 }
 
-func (n *OpenWeatherMap) gatherUrl(addr string) (*Status, error) {
+func (n *OpenWeatherMap) gatherUrlForecastOrGroup(addr string) (*Status, error) {
 	resp, err := n.client.Get(addr)
 	if err != nil {
 		return nil, fmt.Errorf("error making HTTP request to %s: %s", addr, err)
@@ -165,7 +180,30 @@ func (n *OpenWeatherMap) gatherUrl(addr string) (*Status, error) {
 		return nil, fmt.Errorf("%s returned unexpected content type %s", addr, mediaType)
 	}
 
-	return gatherWeatherUrl(resp.Body)
+	return gatherWeatherUrlForecastOrGroup(resp.Body)
+}
+
+func (n *OpenWeatherMap) gatherUrlSingleCity(addr string) (*StatusSingle, error) {
+	resp, err := n.client.Get(addr)
+	if err != nil {
+		return nil, fmt.Errorf("error making HTTP request to %s: %s", addr, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s returned HTTP status %s", addr, resp.Status)
+	}
+
+	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil {
+		return nil, err
+	}
+
+	if mediaType != "application/json" {
+		return nil, fmt.Errorf("%s returned unexpected content type %s", addr, mediaType)
+	}
+
+	return gatherWeatherUrlSingleCity(resp.Body)
 }
 
 type WeatherEntry struct {
@@ -219,7 +257,46 @@ type Status struct {
 	List []WeatherEntry `json:"list"`
 }
 
-func gatherWeatherUrl(r io.Reader) (*Status, error) {
+type StatusSingle struct {
+	Country string `json:"country"`
+	Id      int64  `json:"id"`
+	Name    string `json:"name"`
+	Dt      int64  `json:"dt"`
+	Clouds  struct {
+		All int64 `json:"all"`
+	} `json:"clouds"`
+	Main struct {
+		Humidity int64   `json:"humidity"`
+		Pressure float64 `json:"pressure"`
+		Temp     float64 `json:"temp"`
+	} `json:"main"`
+	Rain struct {
+		Rain1 float64 `json:"1h"`
+		Rain3 float64 `json:"3h"`
+	} `json:"rain"`
+	Sys struct {
+		Country string `json:"country"`
+		Sunrise int64  `json:"sunrise"`
+		Sunset  int64  `json:"sunset"`
+	} `json:"sys"`
+	Wind struct {
+		Deg   float64 `json:"deg"`
+		Speed float64 `json:"speed"`
+	} `json:"wind"`
+	Coord struct {
+		Lat float64 `json:"lat"`
+		Lon float64 `json:"lon"`
+	} `json:"coord"`
+	Visibility int64 `json:"visibility"`
+	Weather    []struct {
+		ID          int64  `json:"id"`
+		Main        string `json:"main"`
+		Description string `json:"description"`
+		Icon        string `json:"icon"`
+	} `json:"weather"`
+}
+
+func gatherWeatherUrlForecastOrGroup(r io.Reader) (*Status, error) {
 	dec := json.NewDecoder(r)
 	status := &Status{}
 	if err := dec.Decode(status); err != nil {
@@ -228,14 +305,57 @@ func gatherWeatherUrl(r io.Reader) (*Status, error) {
 	return status, nil
 }
 
-func gatherRain(e WeatherEntry) float64 {
+func gatherWeatherUrlSingleCity(r io.Reader) (*StatusSingle, error) {
+	dec := json.NewDecoder(r)
+	status := &StatusSingle{}
+	if err := dec.Decode(status); err != nil {
+		return nil, fmt.Errorf("error while decoding JSON response: %s", err)
+	}
+	return status, nil
+}
+
+func gatherRainForecastOrGroup(e WeatherEntry) float64 {
 	if e.Rain.Rain1 > 0 {
 		return e.Rain.Rain1
 	}
 	return e.Rain.Rain3
 }
 
-func gatherWeather(acc telegraf.Accumulator, status *Status) {
+func gatherRainSingleCity(status *StatusSingle) float64 {
+	if status.Rain.Rain1 > 0 {
+		return status.Rain.Rain1
+	}
+	return status.Rain.Rain3
+}
+
+func gatherWeather(acc telegraf.Accumulator, status *StatusSingle) {
+	tm := time.Unix(status.Dt, 0)
+	fields := map[string]interface{}{
+		"cloudiness":   status.Clouds.All,
+		"humidity":     status.Main.Humidity,
+		"pressure":     status.Main.Pressure,
+		"rain":         gatherRainSingleCity(status),
+		"temperature":  status.Main.Temp,
+		"wind_degrees": status.Wind.Deg,
+		"wind_speed":   status.Wind.Speed,
+	}
+	tags := map[string]string{
+		"city_id":  strconv.FormatInt(status.Id, 10),
+		"forecast": "*",
+		"city":     status.Name,
+		"country":  status.Country,
+	}
+
+	if len(status.Weather) > 0 {
+		fields["condition_description"] = status.Weather[0].Description
+		fields["condition_icon"] = status.Weather[0].Icon
+		tags["condition_id"] = strconv.FormatInt(status.Weather[0].ID, 10)
+		tags["condition_main"] = status.Weather[0].Main
+	}
+	acc.AddFields("weather", fields, tags, tm)
+}
+
+func gatherGroup(acc telegraf.Accumulator, status *Status) {
 	for _, e := range status.List {
 		tm := time.Unix(e.Dt, 0)
 
@@ -243,7 +363,7 @@ func gatherWeather(acc telegraf.Accumulator, status *Status) {
 			"cloudiness":   e.Clouds.All,
 			"humidity":     e.Main.Humidity,
 			"pressure":     e.Main.Pressure,
-			"rain":         gatherRain(e),
+			"rain":         gatherRainForecastOrGroup(e),
 			"sunrise":      time.Unix(e.Sys.Sunrise, 0).UnixNano(),
 			"sunset":       time.Unix(e.Sys.Sunset, 0).UnixNano(),
 			"temperature":  e.Main.Temp,
@@ -282,7 +402,7 @@ func gatherForecast(acc telegraf.Accumulator, status *Status) {
 			"cloudiness":   e.Clouds.All,
 			"humidity":     e.Main.Humidity,
 			"pressure":     e.Main.Pressure,
-			"rain":         gatherRain(e),
+			"rain":         gatherRainForecastOrGroup(e),
 			"temperature":  e.Main.Temp,
 			"wind_degrees": e.Wind.Deg,
 			"wind_speed":   e.Wind.Speed,
